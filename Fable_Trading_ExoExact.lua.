@@ -1,0 +1,544 @@
+-- FABLE // Trading
+-- Exo-style Trading tab using the same Exo UI library source referenced
+-- by the uploaded exoui.lua, with the verified Grow a Garden trading functions.
+-- Trading only. No Garden Ascension.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+-- Load the actual Exo UI library source used by the supplied exoui.lua.
+local ok, Library = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/9kkinc-sudo/ui_lib/main/source.lua"))()
+end)
+if not ok or type(Library) ~= "table" then
+    warn("[FABLE] Exo UI failed to load:", Library)
+    return
+end
+
+Library.Scheme.BackgroundColor = Color3.fromRGB(15, 15, 15)
+Library.Scheme.MainColor = Color3.fromRGB(25, 25, 25)
+Library.Scheme.AccentColor = Color3.fromRGB(125, 85, 255)
+Library.Scheme.OutlineColor = Color3.fromRGB(40, 40, 40)
+Library.Scheme.FontColor = Color3.fromRGB(255, 255, 255)
+
+local Window = Library:CreateWindow({
+    Title = "FABLE",
+    Footer = "Trading System",
+    Size = UDim2.fromOffset(500, 360),
+    Center = true,
+    AutoShow = true,
+    Resizable = false,
+    CornerRadius = 4,
+    Font = Enum.Font.Code,
+    ToggleKeybind = Enum.KeyCode.RightControl,
+})
+
+local GE = ReplicatedStorage:WaitForChild("GameEvents")
+local TE = GE:WaitForChild("TradeEvents")
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local DataService = require(Modules:WaitForChild("DataService"))
+local TradingController = require(Modules.TradeControllers:WaitForChild("TradingController"))
+local TradeData = require(ReplicatedStorage.Data:WaitForChild("TradeData"))
+local InvEnums = require(ReplicatedStorage.Data.EnumRegistry:WaitForChild("InventoryServiceEnums"))
+local ItemTypeEnums = require(ReplicatedStorage.Data.EnumRegistry:WaitForChild("ItemTypeEnums"))
+
+local SendRequest = TE:WaitForChild("SendRequest")
+local RespondRequest = TE:WaitForChild("RespondRequest")
+local AddItem = TE:WaitForChild("AddItem")
+local FavoriteRemote = GE:FindFirstChild("Favorite_Item")
+local GiftRemote = GE:FindFirstChild("PetGiftingService")
+
+local PetRegistry
+pcall(function()
+    PetRegistry = require(ReplicatedStorage.Data.PetRegistry)
+end)
+
+local State = {
+    AutoAcceptRequest = false,
+    AutoAcceptTrade = false,
+    AutoConfirmTrade = false,
+    AutoSendTicket = false,
+    AutoUnfavorite = false,
+    SkipLocked = true,
+    GiftSystem = false,
+    MinLevel = 0,
+    MaxLevel = 100,
+    MinWeight = 0,
+    MaxWeight = math.huge,
+}
+
+local Stats = {
+    Sent = 0,
+    Requests = 0,
+    Accepts = 0,
+    Confirms = 0,
+    Added = 0,
+    Unfav = 0,
+    Gifts = 0,
+    Failed = 0,
+}
+
+local Running = true
+local LastRequest = 0
+local RequestCooldown = 4
+local LastAction = "Ready"
+
+local function getData()
+    local ok2, data = pcall(function()
+        return DataService:GetData()
+    end)
+    return ok2 and data or nil
+end
+
+local function getPets()
+    local data = getData()
+    return data and data.PetsData and data.PetsData.PetInventory and data.PetsData.PetInventory.Data or {}
+end
+
+local function getRarity(petType)
+    local entry = PetRegistry and PetRegistry.PetList and PetRegistry.PetList[petType]
+    return entry and (entry.Rarity or entry.RarityName) or nil
+end
+
+local function toSet(value)
+    local out = {}
+    if type(value) ~= "table" then return out end
+    for k, v in pairs(value) do
+        if v == true then
+            out[k] = true
+        elseif type(k) == "number" and v ~= nil then
+            out[v] = true
+        end
+    end
+    return out
+end
+
+local function selectedSets()
+    return toSet(PetPicker.Value), toSet(MutationPicker.Value), toSet(RarityPicker.Value)
+end
+
+local function matches(uuid, pet)
+    local pd = pet and pet.PetData
+    if not pd then return false end
+
+    local pets, muts, rarities = selectedSets()
+    local level = tonumber(pd.Level) or 0
+    local weight = tonumber(pd.BaseWeight) or 0
+    local mutation = pd.MutationType
+    local rarity = getRarity(pet.PetType)
+
+    if level < State.MinLevel or level > State.MaxLevel then return false end
+    if weight < State.MinWeight or weight > State.MaxWeight then return false end
+    if next(pets) and not pets[pet.PetType] then return false end
+    if next(muts) and not muts[mutation] then return false end
+    if next(rarities) and not rarities[rarity] then return false end
+
+    if State.SkipLocked and not State.AutoUnfavorite and pd.IsFavorite == true then
+        return false
+    end
+
+    return true
+end
+
+local function targetPlayer()
+    local p = Target.Value
+    if typeof(p) == "Instance" and p:IsA("Player") and p ~= LocalPlayer then
+        return p
+    end
+    return nil
+end
+
+local function findTicket()
+    local function scan(container)
+        if not container then return nil end
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") and tool:GetAttribute(InvEnums.ITEM_TYPE) == ItemTypeEnums["Trading Ticket"] then
+                return tool
+            end
+        end
+    end
+    return scan(LocalPlayer.Character) or scan(LocalPlayer.Backpack)
+end
+
+local function equipTicket(tool)
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not tool or not hum then return false end
+    if tool.Parent ~= char then
+        local ok2 = pcall(function() hum:EquipTool(tool) end)
+        if not ok2 then return false end
+        task.wait(0.15)
+    end
+    return tool.Parent == char
+end
+
+local function findTool(uuid)
+    local function scan(container)
+        if not container then return nil end
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") then
+                local id = tool:GetAttribute(InvEnums.ITEM_UUID) or tool:GetAttribute("PET_UUID")
+                if id == uuid then return tool end
+            end
+        end
+    end
+    return scan(LocalPlayer.Character) or scan(LocalPlayer.Backpack)
+end
+
+local function unfavorite(uuid)
+    if not FavoriteRemote then return false end
+    local tool = findTool(uuid)
+    if not tool or tool:GetAttribute(InvEnums.Favorite) ~= true then return false end
+    local ok2 = pcall(function() FavoriteRemote:FireServer(tool) end)
+    if ok2 then Stats.Unfav += 1 return true end
+    Stats.Failed += 1
+    return false
+end
+
+local function tradeData()
+    local rep = TradingController.CurrentTradeReplicator
+    if not rep then return nil end
+    local ok2, data = pcall(function() return rep:GetData() end)
+    return ok2 and type(data) == "table" and data or nil
+end
+
+local function addMatchingPets()
+    local trade = tradeData()
+    if not trade then return end
+    local myIndex = table.find(trade.players or {}, LocalPlayer)
+    if not myIndex then return end
+    local offer = trade.offers and trade.offers[myIndex]
+    if not offer then return end
+
+    local items = offer.items or {}
+    local existing = {}
+    for _, item in pairs(items) do
+        if item and item.id then existing[item.id] = true end
+    end
+
+    local count = #items
+    local limit = tonumber(TradeData.ItemLimit) or 12
+    if count >= limit then return end
+
+    for uuid, pet in pairs(getPets()) do
+        if count >= limit then break end
+        if not existing[uuid] and matches(uuid, pet) then
+            if State.AutoUnfavorite and pet.PetData.IsFavorite == true then
+                unfavorite(uuid)
+                task.wait(0.12)
+            end
+            if getPets()[uuid] then
+                local ok2 = pcall(function() AddItem:FireServer("Pet", uuid) end)
+                if ok2 then
+                    existing[uuid] = true
+                    count += 1
+                    Stats.Added += 1
+                else
+                    Stats.Failed += 1
+                end
+            end
+        end
+    end
+end
+
+-- =========================================================
+-- FABLE / EXO TRADING TAB
+-- =========================================================
+local Trading = Window:AddTab({
+    Name = "Trading",
+    Icon = "arrow-left-right",
+    Description = "Trading & gifting automation",
+})
+
+local Requests = Trading:AddLeftGroupbox("Trade Requests", "target and request actions", false)
+Target = Requests:AddDropdown("Target", {
+    Text = "Target Player",
+    SpecialType = "Player",
+    ExcludeLocalPlayer = true,
+})
+
+Requests:AddButton("Send Trade Request", function()
+    local target = targetPlayer()
+    if not target then
+        LastAction = "Select a target first"
+        return
+    end
+    if os.clock() - LastRequest < RequestCooldown then return end
+    LastRequest = os.clock()
+    local ok2 = pcall(function() SendRequest:FireServer(target) end)
+    if ok2 then
+        Stats.Sent += 1
+        LastAction = "Request sent to @" .. target.Name
+    else
+        Stats.Failed += 1
+        LastAction = "Request failed"
+    end
+end)
+
+Requests:AddButton("Refresh Players", function()
+    pcall(function()
+        local list = {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then table.insert(list, player) end
+        end
+        Target:SetValues(list)
+    end)
+end)
+
+local Automation = Trading:AddRightGroupbox("Automation", "same trade states as the game", false)
+Automation:AddToggle("AutoAcceptRequest", {
+    Text = "Auto Accept Requests",
+    Default = false,
+    Callback = function(v) State.AutoAcceptRequest = v end,
+})
+Automation:AddToggle("AutoAcceptTrade", {
+    Text = "Auto Accept Trade",
+    Default = false,
+    Callback = function(v) State.AutoAcceptTrade = v end,
+})
+Automation:AddToggle("AutoConfirmTrade", {
+    Text = "Auto Confirm Trade",
+    Default = false,
+    Callback = function(v) State.AutoConfirmTrade = v end,
+})
+Automation:AddToggle("AutoSendTicket", {
+    Text = "Auto Send Ticket",
+    Default = false,
+    Callback = function(v) State.AutoSendTicket = v end,
+})
+Automation:AddToggle("GiftSystem", {
+    Text = "Enable Gift System",
+    Default = false,
+    Callback = function(v) State.GiftSystem = v end,
+})
+
+local Filters = Trading:AddLeftGroupbox("Pet Filters", "matching uses live PetData", false)
+local petValues = {}
+if PetRegistry and PetRegistry.PetList then
+    for name in pairs(PetRegistry.PetList) do table.insert(petValues, name) end
+    table.sort(petValues)
+end
+PetPicker = Filters:AddDropdown("PetPicker", {
+    Text = "Pets",
+    Values = petValues,
+    Multi = true,
+    MaxVisibleDropdownItems = 8,
+})
+
+local mutationSet = {}
+for _, pet in pairs(getPets()) do
+    local mutation = pet.PetData and pet.PetData.MutationType
+    if mutation and mutation ~= "" then mutationSet[mutation] = true end
+end
+local mutationValues = {}
+for name in pairs(mutationSet) do table.insert(mutationValues, name) end
+table.sort(mutationValues)
+MutationPicker = Filters:AddDropdown("MutationPicker", {
+    Text = "Mutations",
+    Values = mutationValues,
+    Multi = true,
+    MaxVisibleDropdownItems = 8,
+})
+
+local raritySet = {}
+if PetRegistry and PetRegistry.PetList then
+    for _, info in pairs(PetRegistry.PetList) do
+        local rarity = info.Rarity or info.RarityName
+        if rarity then raritySet[rarity] = true end
+    end
+end
+local rarityValues = {}
+for name in pairs(raritySet) do table.insert(rarityValues, name) end
+table.sort(rarityValues)
+RarityPicker = Filters:AddDropdown("RarityPicker", {
+    Text = "Rarity",
+    Values = rarityValues,
+    Multi = true,
+    MaxVisibleDropdownItems = 8,
+})
+
+Filters:AddToggle("AutoUnfavorite", {
+    Text = "Auto Unfavorite Matching Pets",
+    Default = false,
+    Callback = function(v) State.AutoUnfavorite = v end,
+})
+Filters:AddToggle("SkipLocked", {
+    Text = "Skip Locked / Favorite Pets",
+    Default = true,
+    Callback = function(v) State.SkipLocked = v end,
+})
+
+local Ranges = Trading:AddRightGroupbox("Level / Weight", "live PetData fields", false)
+local MinLevel = Ranges:AddSlider("MinLevel", {
+    Text = "Min Level",
+    Default = 0,
+    Min = 0,
+    Max = 100,
+    Rounding = 0,
+})
+local MaxLevel = Ranges:AddSlider("MaxLevel", {
+    Text = "Max Level",
+    Default = 100,
+    Min = 0,
+    Max = 100,
+    Rounding = 0,
+})
+local MinWeight = Ranges:AddInput("MinWeight", {
+    Text = "Min BaseWeight",
+    Default = "0",
+    Numeric = true,
+    ClearTextOnFocus = false,
+})
+local MaxWeight = Ranges:AddInput("MaxWeight", {
+    Text = "Max BaseWeight",
+    Default = "999999",
+    Numeric = true,
+    ClearTextOnFocus = false,
+})
+
+local Status = Trading:AddLeftGroupbox("Status", "live automation state", false)
+local StatusLabel = Status:AddLabel("Ready")
+local TargetLabel = Status:AddLabel("Target: none")
+local TicketLabel = Status:AddLabel("Ticket: checking...")
+local MatchLabel = Status:AddLabel("Matching pets: 0")
+
+local Session = Trading:AddRightGroupbox("Session", "live counters", false)
+local SentLabel = Session:AddLabel("Sent: 0")
+local ReqLabel = Session:AddLabel("Requests: 0")
+local AcceptLabel = Session:AddLabel("Accepts: 0")
+local ConfirmLabel = Session:AddLabel("Confirms: 0")
+local AddedLabel = Session:AddLabel("Added: 0")
+local UnfavLabel = Session:AddLabel("Unfav: 0")
+local GiftLabel = Session:AddLabel("Gifts: 0")
+local FailedLabel = Session:AddLabel("Failed: 0")
+
+local Gift = Trading:AddLeftGroupbox("Gifting", "verified PetGiftingService", true)
+Gift:AddButton("Gift Pet to Target", function()
+    if not State.GiftSystem then return end
+    local target = targetPlayer()
+    if not target or not GiftRemote then return end
+    local ok2 = pcall(function()
+        GiftRemote:FireServer("GivePet", target)
+    end)
+    if ok2 then
+        Stats.Gifts += 1
+        LastAction = "Gift request sent to @" .. target.Name
+    else
+        Stats.Failed += 1
+    end
+end)
+
+-- =========================================================
+-- REQUEST / TRADE AUTOMATION
+-- =========================================================
+RespondRequest.OnClientEvent:Connect(function(sender)
+    if not Running or not State.AutoAcceptRequest then return end
+    if typeof(sender) ~= "Instance" or not sender:IsA("Player") then return end
+    local ok2 = pcall(function() RespondRequest:FireServer(sender, true) end)
+    if ok2 then
+        Stats.Requests += 1
+        LastAction = "Accepted request from @" .. sender.Name
+    else
+        Stats.Failed += 1
+    end
+end)
+
+task.spawn(function()
+    while Running do
+        pcall(function()
+            State.MinLevel = tonumber(MinLevel.Value) or 0
+            State.MaxLevel = tonumber(MaxLevel.Value) or 100
+            State.MinWeight = math.max(0, tonumber(MinWeight.Value) or 0)
+            State.MaxWeight = math.max(State.MinWeight, tonumber(MaxWeight.Value) or math.huge)
+        end)
+
+        local target = targetPlayer()
+        local ticket = findTicket()
+        local matchCount = 0
+        for uuid, pet in pairs(getPets()) do
+            if matches(uuid, pet) then matchCount += 1 end
+        end
+
+        pcall(function()
+            StatusLabel:SetText(LastAction)
+            TargetLabel:SetText("Target: " .. (target and ("@" .. target.Name) or "none"))
+            TicketLabel:SetText("Ticket: " .. (ticket and "FOUND" or "not found"))
+            MatchLabel:SetText("Matching pets: " .. tostring(matchCount))
+            SentLabel:SetText("Sent: " .. Stats.Sent)
+            ReqLabel:SetText("Requests: " .. Stats.Requests)
+            AcceptLabel:SetText("Accepts: " .. Stats.Accepts)
+            ConfirmLabel:SetText("Confirms: " .. Stats.Confirms)
+            AddedLabel:SetText("Added: " .. Stats.Added)
+            UnfavLabel:SetText("Unfav: " .. Stats.Unfav)
+            GiftLabel:SetText("Gifts: " .. Stats.Gifts)
+            FailedLabel:SetText("Failed: " .. Stats.Failed)
+        end)
+
+        if State.AutoSendTicket and target and not TradingController.CurrentTradeReplicator then
+            if ticket then
+                equipTicket(ticket)
+            end
+            if os.clock() - LastRequest >= RequestCooldown then
+                LastRequest = os.clock()
+                local ok2 = pcall(function() SendRequest:FireServer(target) end)
+                if ok2 then
+                    Stats.Sent += 1
+                    LastAction = "Auto request sent"
+                else
+                    Stats.Failed += 1
+                end
+            end
+        end
+
+        local trade = tradeData()
+        if trade then
+            local myIndex = table.find(trade.players or {}, LocalPlayer)
+            if myIndex then
+                local otherIndex = myIndex == 1 and 2 or 1
+                local myState = trade.states and trade.states[myIndex]
+                local otherState = trade.states and trade.states[otherIndex]
+                local elapsed = workspace:GetServerTimeNow() - (tonumber(trade.lastChange) or 0)
+                local cooldown = tonumber(TradeData.ButtonCooldown) or 5
+
+                if myState == "None" then
+                    if State.AutoAcceptTrade and otherState ~= "None" and elapsed >= cooldown then
+                        local ok2 = pcall(function() TradingController:Accept() end)
+                        if ok2 then
+                            Stats.Accepts += 1
+                            LastAction = "Accepted trade"
+                        else
+                            Stats.Failed += 1
+                        end
+                    end
+                    pcall(addMatchingPets)
+
+                elseif myState == "Processing" then
+                    LastAction = "Trade processing"
+
+                elseif myState == "Accepted" then
+                    if State.AutoConfirmTrade and elapsed >= cooldown then
+                        local ok2 = pcall(function() TradingController:Confirm() end)
+                        if ok2 then
+                            Stats.Confirms += 1
+                            LastAction = "Confirmed trade"
+                        else
+                            Stats.Failed += 1
+                        end
+                    end
+
+                elseif myState == "Confirmed" then
+                    LastAction = otherState == "Confirmed" and "Trade complete" or "Waiting for confirmation"
+                end
+            end
+        end
+
+        task.wait(0.15)
+    end
+end)
+
+Library:OnUnload(function()
+    Running = false
+end)
+
+print("[FABLE] Exo Trading UI loaded")
