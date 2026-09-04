@@ -1,0 +1,521 @@
+-- Garden Coordinate Scout v5 — Many Positions
+-- Center-camera scout. Marks up to 500 positions and exports them.
+-- SCOUT ONLY: no egg creation/hatching/selling/equipping.
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local SAVE_FILE = "GardenCoordinateScout_Marks_v5.json"
+local MAX_MARKS = 500
+local MIN_MARK_DISTANCE = 0.35
+local RAY_LENGTH = 2000
+
+local oldGui = PlayerGui:FindFirstChild("GardenCoordinateScoutMany")
+if oldGui then oldGui:Destroy() end
+
+local oldMarkers = workspace:FindFirstChild("GardenCoordinateScoutManyMarkers")
+if oldMarkers then oldMarkers:Destroy() end
+
+local function tryCall(name, ...)
+    local fn
+    if type(getgenv) == "function" then
+        local env = getgenv()
+        if type(env[name]) == "function" then fn = env[name] end
+    end
+    if not fn and type(_G[name]) == "function" then fn = _G[name] end
+    if not fn and name == "writefile" and type(writefile) == "function" then fn = writefile end
+    if not fn and name == "readfile" and type(readfile) == "function" then fn = readfile end
+    if not fn and name == "isfile" and type(isfile) == "function" then fn = isfile end
+    if not fn and name == "setclipboard" and type(setclipboard) == "function" then fn = setclipboard end
+    if not fn and name == "toclipboard" and type(toclipboard) == "function" then fn = toclipboard end
+    if not fn then return false, nil end
+    return pcall(fn, ...)
+end
+
+local function copyText(text)
+    local ok = tryCall("setclipboard", text)
+    if ok then return true end
+    ok = tryCall("toclipboard", text)
+    return ok
+end
+
+local function encodeMarks(marks)
+    local data = {}
+    for i, p in ipairs(marks) do
+        data[i] = {x = p.X, y = p.Y, z = p.Z}
+    end
+    local ok, encoded = pcall(HttpService.JSONEncode, HttpService, data)
+    return ok and encoded or nil
+end
+
+local function saveMarks(marks)
+    local encoded = encodeMarks(marks)
+    if not encoded then return false, "JSON encode failed" end
+    local ok = tryCall("writefile", SAVE_FILE, encoded)
+    return ok, ok and nil or "writefile unavailable"
+end
+
+local function loadMarks()
+    local exists = tryCall("isfile", SAVE_FILE)
+    if not exists then return {} end
+    local ok, contents = tryCall("readfile", SAVE_FILE)
+    if not ok or type(contents) ~= "string" then return {} end
+    local decodedOk, decoded = pcall(HttpService.JSONDecode, HttpService, contents)
+    if not decodedOk or type(decoded) ~= "table" then return {} end
+
+    local marks = {}
+    for _, v in ipairs(decoded) do
+        if #marks >= MAX_MARKS then break end
+        if type(v) == "table" and tonumber(v.x) and tonumber(v.y) and tonumber(v.z) then
+            marks[#marks + 1] = Vector3.new(tonumber(v.x), tonumber(v.y), tonumber(v.z))
+        end
+    end
+    return marks
+end
+
+local Marks = loadMarks()
+
+local MarkerFolder = Instance.new("Folder")
+MarkerFolder.Name = "GardenCoordinateScoutManyMarkers"
+MarkerFolder.Parent = workspace
+
+local MarkerObjects = {}
+
+local function makeMarker(position, index)
+    local part = Instance.new("Part")
+    part.Name = "Mark_" .. index
+    part.Size = Vector3.new(0.9, 0.14, 0.9)
+    part.Position = position + Vector3.new(0, 0.18, 0)
+    part.Anchored = true
+    part.CanCollide = false
+    part.CanTouch = false
+    part.CanQuery = false
+    part.Material = Enum.Material.Neon
+    part.Color = Color3.fromRGB(80, 255, 135)
+    part.Transparency = 0.12
+    part.Parent = MarkerFolder
+    return part
+end
+
+local function rebuildMarkers()
+    for _, marker in ipairs(MarkerObjects) do
+        if marker and marker.Parent then marker:Destroy() end
+    end
+    table.clear(MarkerObjects)
+    for i, point in ipairs(Marks) do
+        MarkerObjects[i] = makeMarker(point, i)
+    end
+end
+
+local markersVisible = true
+
+local function refreshMarkers()
+    for _, marker in ipairs(MarkerObjects) do
+        if marker and marker.Parent then
+            marker.Transparency = markersVisible and 0.12 or 1
+        end
+    end
+end
+
+rebuildMarkers()
+
+local function getCenterHit()
+    local camera = workspace.CurrentCamera
+    if not camera then return nil end
+
+    local viewport = camera.ViewportSize
+    local ray = camera:ViewportPointToRay(viewport.X * 0.5, viewport.Y * 0.5, 0)
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = false
+    params.FilterDescendantsInstances = {LocalPlayer.Character, MarkerFolder}
+
+    local result = workspace:Raycast(ray.Origin, ray.Direction * RAY_LENGTH, params)
+    return result and result.Position or nil
+end
+
+local function vectorString(point)
+    return string.format("Vector3.new(%.9f, %.9f, %.9f)", point.X, point.Y, point.Z)
+end
+
+local function closestDistance(point)
+    local closest = math.huge
+    for _, p in ipairs(Marks) do
+        local d = (p - point).Magnitude
+        if d < closest then closest = d end
+    end
+    return closest
+end
+
+local Gui = Instance.new("ScreenGui")
+Gui.Name = "GardenCoordinateScoutMany"
+Gui.ResetOnSpawn = false
+Gui.IgnoreGuiInset = true
+Gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+Gui.DisplayOrder = 999999
+Gui.Parent = PlayerGui
+
+local Crosshair = Instance.new("Frame")
+Crosshair.Size = UDim2.fromOffset(22, 22)
+Crosshair.Position = UDim2.new(0.5, -11, 0.5, -11)
+Crosshair.BackgroundTransparency = 1
+Crosshair.ZIndex = 1000
+Crosshair.Parent = Gui
+
+local function crossLine(pos, size)
+    local line = Instance.new("Frame")
+    line.Position = pos
+    line.Size = size
+    line.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    line.BorderSizePixel = 0
+    line.ZIndex = 1001
+    line.Parent = Crosshair
+end
+
+crossLine(UDim2.new(0.5, -1, 0, 0), UDim2.fromOffset(2, 22))
+crossLine(UDim2.new(0, 0, 0.5, -1), UDim2.fromOffset(22, 2))
+
+local Main = Instance.new("Frame")
+Main.Name = "Main"
+Main.Size = UDim2.fromOffset(390, 420)
+Main.Position = UDim2.fromOffset(12, 88)
+Main.BackgroundColor3 = Color3.fromRGB(15, 17, 23)
+Main.BorderSizePixel = 0
+Main.Active = true
+Main.Parent = Gui
+
+local mc = Instance.new("UICorner")
+mc.CornerRadius = UDim.new(0, 11)
+mc.Parent = Main
+
+local ms = Instance.new("UIStroke")
+ms.Thickness = 1
+ms.Color = Color3.fromRGB(70, 76, 92)
+ms.Parent = Main
+
+local function label(parent, text, pos, size, textSize, bold)
+    local obj = Instance.new("TextLabel")
+    obj.BackgroundTransparency = 1
+    obj.Position = pos
+    obj.Size = size
+    obj.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    obj.Text = text
+    obj.TextColor3 = Color3.fromRGB(235, 238, 245)
+    obj.TextSize = textSize
+    obj.TextXAlignment = Enum.TextXAlignment.Left
+    obj.TextYAlignment = Enum.TextYAlignment.Center
+    obj.Parent = parent
+    return obj
+end
+
+label(Main, "GARDEN COORDINATE SCOUT v5", UDim2.fromOffset(14, 9), UDim2.new(1, -28, 0, 25), 14, true)
+
+local sub = label(Main, "MANY POSITION MODE • CENTER-AIM", UDim2.fromOffset(14, 31), UDim2.new(1, -28, 0, 18), 8, false)
+sub.TextColor3 = Color3.fromRGB(120, 225, 145)
+
+local warning = label(Main, "MARK uses the center of your camera.", UDim2.fromOffset(14, 51), UDim2.new(1, -28, 0, 18), 8, false)
+warning.TextColor3 = Color3.fromRGB(115, 218, 145)
+
+local TargetBox = Instance.new("Frame")
+TargetBox.Position = UDim2.fromOffset(10, 76)
+TargetBox.Size = UDim2.new(1, -20, 0, 105)
+TargetBox.BackgroundColor3 = Color3.fromRGB(9, 11, 16)
+TargetBox.BorderSizePixel = 0
+TargetBox.Parent = Main
+
+local tc = Instance.new("UICorner")
+tc.CornerRadius = UDim.new(0, 8)
+tc.Parent = TargetBox
+
+local ts = Instance.new("UIStroke")
+ts.Color = Color3.fromRGB(35, 39, 48)
+ts.Parent = TargetBox
+
+local targetTitle = label(TargetBox, "CURRENT CENTER TARGET", UDim2.fromOffset(11, 6), UDim2.new(1, -22, 0, 16), 9, true)
+targetTitle.TextColor3 = Color3.fromRGB(145, 152, 170)
+
+local XText = label(TargetBox, "X: ---", UDim2.fromOffset(11, 29), UDim2.new(1, -22, 0, 18), 12, true)
+local YText = label(TargetBox, "Y: ---", UDim2.fromOffset(11, 51), UDim2.new(1, -22, 0, 18), 12, true)
+local ZText = label(TargetBox, "Z: ---", UDim2.fromOffset(11, 73), UDim2.new(1, -22, 0, 18), 12, true)
+
+local function button(text, pos, size, bg)
+    local b = Instance.new("TextButton")
+    b.Position = pos
+    b.Size = size
+    b.BackgroundColor3 = bg
+    b.BorderSizePixel = 0
+    b.Text = text
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 10
+    b.TextColor3 = Color3.fromRGB(238, 242, 248)
+    b.AutoButtonColor = true
+    b.Parent = Main
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent = b
+    return b
+end
+
+local MarkButton = button("MARK POSITION", UDim2.fromOffset(10, 191), UDim2.new(0.5, -15, 0, 40), Color3.fromRGB(46, 96, 63))
+local CopyButton = button("COPY ALL MARKS", UDim2.new(0.5, 5, 0, 191), UDim2.new(0.5, -15, 0, 40), Color3.fromRGB(48, 61, 88))
+local ClearButton = button("CLEAR ALL", UDim2.fromOffset(10, 237), UDim2.new(0.5, -15, 0, 35), Color3.fromRGB(91, 53, 53))
+local ReloadButton = button("RELOAD SAVED", UDim2.new(0.5, 5, 0, 237), UDim2.new(0.5, -15, 0, 35), Color3.fromRGB(55, 66, 87))
+local MarkerButton = button("MARKERS: ON", UDim2.fromOffset(10, 279), UDim2.new(0.5, -15, 0, 32), Color3.fromRGB(55, 105, 68))
+local CopyJsonButton = button("COPY JSON", UDim2.new(0.5, 5, 0, 279), UDim2.new(0.5, -15, 0, 32), Color3.fromRGB(55, 66, 87))
+local SaveButton = button("SAVE", UDim2.fromOffset(10, 317), UDim2.new(0.5, -15, 0, 32), Color3.fromRGB(52, 75, 62))
+local CopyCurrentButton = button("COPY CURRENT", UDim2.new(0.5, 5, 0, 317), UDim2.new(0.5, -15, 0, 32), Color3.fromRGB(55, 66, 87))
+
+local Status = label(Main, "Status: READY", UDim2.fromOffset(12, 357), UDim2.new(1, -24, 0, 18), 9, true)
+Status.TextColor3 = Color3.fromRGB(120, 225, 145)
+
+local Count = label(Main, ("Saved marks: %d / %d"):format(#Marks, MAX_MARKS), UDim2.fromOffset(12, 377), UDim2.new(1, -24, 0, 18), 9, false)
+Count.TextColor3 = Color3.fromRGB(155, 160, 173)
+
+local FileLabel = label(Main, "File: " .. SAVE_FILE, UDim2.fromOffset(12, 397), UDim2.new(1, -24, 0, 15), 8, false)
+FileLabel.TextColor3 = Color3.fromRGB(105, 110, 125)
+
+local function updateCount()
+    Count.Text = ("Saved marks: %d / %d"):format(#Marks, MAX_MARKS)
+end
+
+MarkButton.Activated:Connect(function()
+    local point = getCenterHit()
+
+    if not point then
+        Status.Text = "Status: NO SURFACE UNDER CROSSHAIR"
+        Status.TextColor3 = Color3.fromRGB(255, 150, 120)
+        return
+    end
+
+    if #Marks >= MAX_MARKS then
+        Status.Text = ("Status: MAX %d MARKS REACHED"):format(MAX_MARKS)
+        Status.TextColor3 = Color3.fromRGB(255, 205, 110)
+        return
+    end
+
+    local closest = closestDistance(point)
+
+    if closest < MIN_MARK_DISTANCE then
+        Status.Text = ("Status: TOO CLOSE TO EXISTING MARK (%.2f)"):format(closest)
+        Status.TextColor3 = Color3.fromRGB(255, 205, 110)
+        return
+    end
+
+    Marks[#Marks + 1] = point
+    local index = #Marks
+    MarkerObjects[index] = makeMarker(point, index)
+
+    saveMarks(Marks)
+    updateCount()
+
+    Status.Text = ("Status: MARK %d SAVED"):format(index)
+    Status.TextColor3 = Color3.fromRGB(120, 225, 145)
+
+    print(("[Garden Scout v5] Mark %d = %s"):format(index, vectorString(point)))
+end)
+
+CopyButton.Activated:Connect(function()
+    local lines = {"local POSITIONS = {"}
+
+    for i, point in ipairs(Marks) do
+        lines[#lines + 1] = ("    [%d] = %s,"):format(i, vectorString(point))
+    end
+
+    lines[#lines + 1] = "}"
+    local output = table.concat(lines, "\n")
+
+    print("============================================")
+    print("[Garden Scout v5] ALL MARKS")
+    print(output)
+    print("============================================")
+
+    if copyText(output) then
+        Status.Text = ("Status: COPIED %d MARKS"):format(#Marks)
+        Status.TextColor3 = Color3.fromRGB(120, 190, 255)
+        CopyButton.Text = "COPIED ALL MARKS"
+        task.delay(1.25, function()
+            if CopyButton.Parent then CopyButton.Text = "COPY ALL MARKS" end
+        end)
+    else
+        Status.Text = ("Status: PRINTED %d MARKS"):format(#Marks)
+        Status.TextColor3 = Color3.fromRGB(255, 205, 110)
+    end
+end)
+
+CopyJsonButton.Activated:Connect(function()
+    local encoded = encodeMarks(Marks)
+
+    if not encoded then
+        Status.Text = "Status: JSON ENCODE FAILED"
+        Status.TextColor3 = Color3.fromRGB(255, 150, 120)
+        return
+    end
+
+    print("[Garden Scout v5] JSON:")
+    print(encoded)
+
+    if copyText(encoded) then
+        Status.Text = ("Status: COPIED JSON (%d MARKS)"):format(#Marks)
+        Status.TextColor3 = Color3.fromRGB(120, 190, 255)
+        CopyJsonButton.Text = "COPIED JSON"
+        task.delay(1.25, function()
+            if CopyJsonButton.Parent then CopyJsonButton.Text = "COPY JSON" end
+        end)
+    else
+        Status.Text = "Status: JSON PRINTED"
+        Status.TextColor3 = Color3.fromRGB(255, 205, 110)
+    end
+end)
+
+ClearButton.Activated:Connect(function()
+    table.clear(Marks)
+
+    for _, marker in ipairs(MarkerObjects) do
+        if marker and marker.Parent then marker:Destroy() end
+    end
+
+    table.clear(MarkerObjects)
+    saveMarks(Marks)
+    updateCount()
+
+    Status.Text = "Status: ALL MARKS CLEARED"
+    Status.TextColor3 = Color3.fromRGB(255, 160, 140)
+end)
+
+ReloadButton.Activated:Connect(function()
+    Marks = loadMarks()
+    rebuildMarkers()
+    refreshMarkers()
+    updateCount()
+
+    Status.Text = ("Status: RELOADED %d MARKS"):format(#Marks)
+    Status.TextColor3 = Color3.fromRGB(120, 190, 255)
+end)
+
+SaveButton.Activated:Connect(function()
+    local ok, reason = saveMarks(Marks)
+
+    if ok then
+        Status.Text = ("Status: SAVED %d MARKS"):format(#Marks)
+        Status.TextColor3 = Color3.fromRGB(120, 225, 145)
+    else
+        Status.Text = "Status: SAVE FAILED - " .. tostring(reason)
+        Status.TextColor3 = Color3.fromRGB(255, 150, 120)
+    end
+end)
+
+CopyCurrentButton.Activated:Connect(function()
+    local point = getCenterHit()
+
+    if not point then
+        Status.Text = "Status: NO SURFACE UNDER CROSSHAIR"
+        Status.TextColor3 = Color3.fromRGB(255, 150, 120)
+        return
+    end
+
+    local text = vectorString(point)
+    print("[Garden Scout v5] Current =", text)
+
+    if copyText(text) then
+        Status.Text = "Status: CURRENT COPIED"
+        Status.TextColor3 = Color3.fromRGB(120, 190, 255)
+    else
+        Status.Text = "Status: CURRENT PRINTED"
+        Status.TextColor3 = Color3.fromRGB(255, 205, 110)
+    end
+end)
+
+MarkerButton.Activated:Connect(function()
+    markersVisible = not markersVisible
+    refreshMarkers()
+
+    if markersVisible then
+        MarkerButton.Text = "MARKERS: ON"
+        MarkerButton.BackgroundColor3 = Color3.fromRGB(55, 105, 68)
+    else
+        MarkerButton.Text = "MARKERS: OFF"
+        MarkerButton.BackgroundColor3 = Color3.fromRGB(48, 52, 63)
+    end
+end)
+
+local dragging = false
+local dragStart
+local startPosition
+
+local DragHandle = Instance.new("Frame")
+DragHandle.Name = "DragHandle"
+DragHandle.Position = UDim2.fromOffset(0, 0)
+DragHandle.Size = UDim2.new(1, 0, 0, 42)
+DragHandle.BackgroundTransparency = 1
+DragHandle.Active = true
+DragHandle.Parent = Main
+
+DragHandle.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPosition = Main.Position
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if not dragging then return end
+
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        local delta = input.Position - dragStart
+
+        Main.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+task.spawn(function()
+    while Gui.Parent do
+        local point = getCenterHit()
+
+        if point then
+            XText.Text = ("X: %.9f"):format(point.X)
+            YText.Text = ("Y: %.9f"):format(point.Y)
+            ZText.Text = ("Z: %.9f"):format(point.Z)
+        else
+            XText.Text = "X: ---"
+            YText.Text = "Y: ---"
+            ZText.Text = "Z: ---"
+        end
+
+        task.wait(0.05)
+    end
+end)
+
+updateCount()
+
+print("============================================")
+print("[Garden Coordinate Scout v5] LOADED")
+print("[Garden Coordinate Scout v5] CENTER-AIM MODE")
+print("[Garden Coordinate Scout v5] Maximum marks:", MAX_MARKS)
+print("[Garden Coordinate Scout v5] Saved marks:", #Marks)
+print("[Garden Coordinate Scout v5] Save file:", SAVE_FILE)
+print("[Garden Coordinate Scout v5] Copy format: local POSITIONS = {...}")
+print("[Garden Coordinate Scout v5] SCOUT ONLY")
+print("============================================")
+
+return Gui
