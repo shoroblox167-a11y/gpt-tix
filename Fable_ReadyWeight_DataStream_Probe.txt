@@ -1,0 +1,193 @@
+--[[
+    FABLE READY-WEIGHT DATASTREAM PROBE
+
+    Purpose:
+      Correlate an egg's EggReadyToHatch_RE UUID with subsequent
+      GameEvents.DataStream updates.
+
+    Diagnostic only:
+      - Does NOT create eggs.
+      - Does NOT hatch eggs.
+      - Does NOT equip/sell pets.
+      - Does NOT alter replicated data.
+
+    The probe is intentionally independent of Fable's existing inspector.
+    It listens beside ReplicationClass and recursively searches update payloads
+    for the ready egg UUID, PetData, and BaseWeight.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local LocalPlayer = Players.LocalPlayer
+local GameEvents = ReplicatedStorage:WaitForChild("GameEvents")
+local ReadyRE = GameEvents:WaitForChild("EggReadyToHatch_RE")
+local DataStream = GameEvents:WaitForChild("DataStream")
+
+local armedUUID = nil
+local armedPetType = nil
+local armedAt = 0
+local sequence = 0
+
+local seenPaths = {}
+local MAX_PRINTS_PER_PACKET = 80
+
+local function safeToString(value)
+    local ok, result = pcall(function()
+        return tostring(value)
+    end)
+
+    if ok then
+        return result
+    end
+
+    return "<tostring failed>"
+end
+
+local function isNumber(value)
+    return typeof(value) == "number" and value == value
+end
+
+local function pathContainsUUID(path)
+    if not armedUUID then
+        return false
+    end
+
+    return string.find(path, armedUUID, 1, true) ~= nil
+end
+
+local function printMatch(kind, path, value)
+    local key = kind .. "|" .. path .. "|" .. safeToString(value)
+
+    if seenPaths[key] then
+        return
+    end
+
+    seenPaths[key] = true
+
+    print(string.format(
+        "[FABLE-PROBE][%s] +%.4fs | %s = %s",
+        kind,
+        os.clock() - armedAt,
+        path,
+        safeToString(value)
+    ))
+end
+
+local function scan(value, path, depth, state)
+    if state.prints >= MAX_PRINTS_PER_PACKET then
+        return
+    end
+
+    if depth > 8 then
+        return
+    end
+
+    local valueType = typeof(value)
+
+    if valueType ~= "table" then
+        if pathContainsUUID(path) then
+            state.prints += 1
+            printMatch("UUID_PATH", path, value)
+        end
+        return
+    end
+
+    for key, child in pairs(value) do
+        if state.prints >= MAX_PRINTS_PER_PACKET then
+            break
+        end
+
+        local keyText = safeToString(key)
+        local childPath = path .. "/" .. keyText
+
+        if armedUUID and keyText == armedUUID then
+            state.prints += 1
+            printMatch("UUID_KEY", childPath, child)
+        end
+
+        if keyText == "BaseWeight" then
+            state.prints += 1
+            printMatch("BASEWEIGHT", childPath, child)
+        elseif keyText == "PetData" then
+            state.prints += 1
+            printMatch("PETDATA", childPath, "<table>")
+        elseif keyText == "PetType" then
+            state.prints += 1
+            printMatch("PETTYPE", childPath, child)
+        elseif keyText == "WeightRange" then
+            state.prints += 1
+            printMatch("WEIGHTRANGE", childPath, child)
+        elseif keyText == "HatchedFrom" then
+            state.prints += 1
+            printMatch("HATCHEDFROM", childPath, child)
+        end
+
+        if armedUUID and type(child) == "table" then
+            local encodedKey = safeToString(key)
+            if encodedKey == armedUUID or string.find(childPath, armedUUID, 1, true) then
+                state.prints += 1
+                printMatch("UUID_MATCH", childPath, child)
+            end
+        end
+
+        scan(child, childPath, depth + 1, state)
+    end
+end
+
+local function inspectPacket(label, values)
+    if not armedUUID then
+        return
+    end
+
+    sequence += 1
+
+    local dt = os.clock() - armedAt
+
+    print(string.format(
+        "[FABLE-PROBE][DATASTREAM #%d] +%.4fs | %s | args=%d",
+        sequence,
+        dt,
+        label,
+        #values
+    ))
+
+    local state = { prints = 0 }
+
+    for i, value in ipairs(values) do
+        scan(value, "ARG[" .. tostring(i) .. "]", 0, state)
+
+        if state.prints >= MAX_PRINTS_PER_PACKET then
+            print("[FABLE-PROBE] print limit reached for packet")
+            break
+        end
+    end
+end
+
+ReadyRE.OnClientEvent:Connect(function(petType, eggUUID)
+    armedPetType = safeToString(petType)
+    armedUUID = safeToString(eggUUID)
+    armedAt = os.clock()
+    sequence = 0
+    table.clear(seenPaths)
+
+    print("============================================")
+    print("[FABLE-PROBE] EGG READY")
+    print("[FABLE-PROBE] Player:", LocalPlayer.Name)
+    print("[FABLE-PROBE] PetType:", armedPetType)
+    print("[FABLE-PROBE] EggUUID:", armedUUID)
+    print("[FABLE-PROBE] Watching DataStream now...")
+    print("============================================")
+end)
+
+DataStream.OnClientEvent:Connect(function(...)
+    local values = { ... }
+    inspectPacket("Update", values)
+end)
+
+print("============================================")
+print("[FABLE-PROBE] READY-WEIGHT DATASTREAM PROBE LOADED")
+print("[FABLE-PROBE] Waiting for EggReadyToHatch_RE...")
+print("[FABLE-PROBE] Then watching GameEvents.DataStream")
+print("[FABLE-PROBE] No game actions are performed")
+print("============================================")
