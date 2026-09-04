@@ -1,0 +1,304 @@
+--[[
+    FABLE READY-WEIGHT DATASTREAM PROBE V2
+
+    Purpose:
+      Capture DataStream traffic continuously, retain a short rolling buffer,
+      then correlate the traffic immediately BEFORE and AFTER
+      EggReadyToHatch_RE for the ready egg UUID.
+
+    Diagnostic only:
+      - Does NOT create eggs.
+      - Does NOT hatch eggs.
+      - Does NOT equip/sell pets.
+      - Does NOT modify replicated data.
+
+    Why V2:
+      The first probe armed DataStream only AFTER EggReadyToHatch_RE.
+      With hatch-time-reduction pets, the useful replication update may arrive
+      immediately BEFORE the ready event. V2 keeps a rolling packet history.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local LocalPlayer = Players.LocalPlayer
+local GameEvents = ReplicatedStorage:WaitForChild("GameEvents")
+local ReadyRE = GameEvents:WaitForChild("EggReadyToHatch_RE")
+local DataStream = GameEvents:WaitForChild("DataStream")
+
+local BUFFER_SECONDS = 8
+local MAX_BUFFER_PACKETS = 250
+local MAX_SCAN_DEPTH = 10
+local MAX_PRINTS_PER_PACKET = 60
+local POST_READY_SECONDS = 3
+
+local packetBuffer = {}
+local armedUUID = nil
+local armedPetType = nil
+local armedAt = 0
+local sequence = 0
+local readySequence = 0
+local printedKeys = {}
+local postReadyUntil = 0
+
+local function safeToString(value)
+    local ok, result = pcall(function()
+        return tostring(value)
+    end)
+    return ok and result or "<tostring failed>"
+end
+
+local function now()
+    return os.clock()
+end
+
+local function trimBuffer()
+    local cutoff = now() - BUFFER_SECONDS
+
+    while #packetBuffer > MAX_BUFFER_PACKETS do
+        table.remove(packetBuffer, 1)
+    end
+
+    while packetBuffer[1] and packetBuffer[1].time < cutoff do
+        table.remove(packetBuffer, 1)
+    end
+end
+
+local function pathContainsUUID(path, uuid)
+    return uuid and string.find(path, uuid, 1, true) ~= nil
+end
+
+local function packetRelevant(packet, uuid)
+    if not uuid then
+        return false
+    end
+
+    local function contains(value, depth)
+        if depth > MAX_SCAN_DEPTH then
+            return false
+        end
+
+        if type(value) ~= "table" then
+            return string.find(safeToString(value), uuid, 1, true) ~= nil
+        end
+
+        for key, child in pairs(value) do
+            if string.find(safeToString(key), uuid, 1, true) ~= nil then
+                return true
+            end
+            if contains(child, depth + 1) then
+                return true
+            end
+        end
+
+        return false
+    end
+
+    for _, value in ipairs(packet.values) do
+        if contains(value, 0) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function printOnce(kind, path, value, packetTime, relativeToReady)
+    local key = kind .. "|" .. path .. "|" .. safeToString(value)
+    if printedKeys[key] then
+        return
+    end
+
+    printedKeys[key] = true
+
+    local relation
+    if relativeToReady then
+        relation = string.format("ready%+.4fs", packetTime - relativeToReady)
+    else
+        relation = "ready?"
+    end
+
+    print(string.format(
+        "[FABLE-PROBE-V2][%s] %s | %s = %s",
+        kind,
+        relation,
+        path,
+        safeToString(value)
+    ))
+end
+
+local function scan(value, path, depth, state, packetTime, readyTime, uuid)
+    if state.prints >= MAX_PRINTS_PER_PACKET then
+        return
+    end
+
+    if depth > MAX_SCAN_DEPTH then
+        return
+    end
+
+    if type(value) ~= "table" then
+        if pathContainsUUID(path, uuid) then
+            state.prints += 1
+            printOnce("UUID_PATH", path, value, packetTime, readyTime)
+        end
+        return
+    end
+
+    for key, child in pairs(value) do
+        if state.prints >= MAX_SCAN_PRINTS then
+            break
+        end
+
+        local keyText = safeToString(key)
+        local childPath = path .. "/" .. keyText
+
+        if uuid and keyText == uuid then
+            state.prints += 1
+            printOnce("UUID_KEY", childPath, child, packetTime, readyTime)
+        end
+
+        if keyText == "BaseWeight" then
+            state.prints += 1
+            printOnce("BASEWEIGHT", childPath, child, packetTime, readyTime)
+        elseif keyText == "PetData" then
+            state.prints += 1
+            printOnce("PETDATA", childPath, "<table>", packetTime, readyTime)
+        elseif keyText == "PetType" then
+            state.prints += 1
+            printOnce("PETTYPE", childPath, child, packetTime, readyTime)
+        elseif keyText == "WeightRange" then
+            state.prints += 1
+            printOnce("WEIGHTRANGE", childPath, child, packetTime, readyTime)
+        elseif keyText == "HatchedFrom" then
+            state.prints += 1
+            printOnce("HATCHEDFROM", childPath, child, packetTime, readyTime)
+        elseif keyText == "GeneratedPetData" then
+            state.prints += 1
+            printOnce("GENERATEDPETDATA", childPath, "<table>", packetTime, readyTime)
+        end
+
+        scan(child, childPath, depth + 1, state, packetTime, readyTime, uuid)
+    end
+end
+
+-- Fix the intentionally local print-limit reference before scan is used.
+MAX_SCAN_PRINTS = MAX_PRINTS_PER_PACKET
+
+local function inspectPacket(packet, readyTime, force)
+    if not armedUUID then
+        return
+    end
+
+    if not force and readyTime and packet.time < readyTime then
+        return
+    end
+
+    if not force and packet.time > postReadyUntil then
+        return
+    end
+
+    if not force and not packetRelevant(packet, armedUUID) then
+        return
+    end
+
+    local state = { prints = 0 }
+    local label = packet.time <= (readyTime or math.huge) and "PRE_READY" or "POST_READY"
+
+    print(string.format(
+        "[FABLE-PROBE-V2][%s] packet #%d dt=%+.4fs args=%d",
+        label,
+        packet.sequence,
+        readyTime and (packet.time - readyTime) or 0,
+        #packet.values
+    ))
+
+    for i, value in ipairs(packet.values) do
+        scan(value, "ARG[" .. tostring(i) .. "]", 0, state, packet.time, readyTime, armedUUID)
+        if state.prints >= MAX_PRINTS_PER_PACKET then
+            print("[FABLE-PROBE-V2] print limit reached")
+            break
+        end
+    end
+end
+
+local function dumpRecentTraffic()
+    if not armedUUID then
+        return
+    end
+
+    print("============================================")
+    print("[FABLE-PROBE-V2] CORRELATING BUFFER")
+    print("[FABLE-PROBE-V2] UUID:", armedUUID)
+    print("[FABLE-PROBE-V2] PetType:", armedPetType)
+    print("[FABLE-PROBE-V2] Searching previous", BUFFER_SECONDS, "seconds")
+    print("============================================")
+
+    local relevant = 0
+
+    for _, packet in ipairs(packetBuffer) do
+        if packet.time <= armedAt and packetRelevant(packet, armedUUID) then
+            relevant += 1
+            inspectPacket(packet, armedAt, true)
+        end
+    end
+
+    if relevant == 0 then
+        print("[FABLE-PROBE-V2] No pre-ready DataStream packet contained the UUID.")
+    else
+        print("[FABLE-PROBE-V2] Relevant pre-ready packets:", relevant)
+    end
+end
+
+DataStream.OnClientEvent:Connect(function(...)
+    local values = { ... }
+
+    sequence += 1
+
+    local packet = {
+        time = now(),
+        sequence = sequence,
+        values = values
+    }
+
+    table.insert(packetBuffer, packet)
+    trimBuffer()
+
+    -- If READY has already fired, inspect this packet immediately.
+    if armedUUID and packet.time <= postReadyUntil then
+        inspectPacket(packet, armedAt, false)
+    end
+end)
+
+ReadyRE.OnClientEvent:Connect(function(petType, eggUUID)
+    armedPetType = safeToString(petType)
+    armedUUID = safeToString(eggUUID)
+    armedAt = now()
+    postReadyUntil = armedAt + POST_READY_SECONDS
+    readySequence += 1
+    table.clear(printedKeys)
+
+    print("============================================")
+    print("[FABLE-PROBE-V2] EGG READY #" .. tostring(readySequence))
+    print("[FABLE-PROBE-V2] Player:", LocalPlayer.Name)
+    print("[FABLE-PROBE-V2] PetType:", armedPetType)
+    print("[FABLE-PROBE-V2] EggUUID:", armedUUID)
+    print("[FABLE-PROBE-V2] Searching PRE-READY buffer...")
+    print("============================================")
+
+    dumpRecentTraffic()
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        trimBuffer()
+    end
+end)
+
+print("============================================")
+print("[FABLE-PROBE-V2] READY-WEIGHT DATASTREAM PROBE LOADED")
+print("[FABLE-PROBE-V2] Continuous DataStream buffer:", BUFFER_SECONDS, "seconds")
+print("[FABLE-PROBE-V2] Post-ready capture:", POST_READY_SECONDS, "seconds")
+print("[FABLE-PROBE-V2] Waiting for EggReadyToHatch_RE...")
+print("[FABLE-PROBE-V2] No game actions are performed")
+print("============================================")
