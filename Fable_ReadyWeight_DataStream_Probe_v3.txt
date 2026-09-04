@@ -1,0 +1,179 @@
+-- FABLE READY-WEIGHT DATASTREAM PROBE V3
+-- Diagnostic only: does not create/hatch/equip/sell anything.
+-- Buffers DataStream traffic, then dumps GeneratedPetData contents around READY.
+
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local Events = RS:WaitForChild("GameEvents")
+local ReadyRE = Events:WaitForChild("EggReadyToHatch_RE")
+local DataStream = Events:WaitForChild("DataStream")
+local player = Players.LocalPlayer
+
+local BUFFER = 10
+local POST = 4
+local MAX_DEPTH = 10
+local MAX_LINES = 220
+
+local packets = {}
+local seq = 0
+local readyAt = nil
+local readyUUID = nil
+local readyPet = nil
+local lines = 0
+
+local function s(v)
+    local ok, r = pcall(tostring, v)
+    return ok and r or "<tostring failed>"
+end
+
+local function prune()
+    local cutoff = os.clock() - BUFFER
+    while #packets > 400 or (packets[1] and packets[1].time < cutoff) do
+        table.remove(packets, 1)
+        if #packets == 0 then break end
+    end
+end
+
+local function hasUUID(value, uuid, depth, seen)
+    if depth > MAX_DEPTH then return false end
+    if type(value) ~= "table" then return s(value) == uuid end
+    seen = seen or {}
+    if seen[value] then return false end
+    seen[value] = true
+    for k, v in pairs(value) do
+        if s(k) == uuid or s(v) == uuid then return true end
+        if type(v) == "table" and hasUUID(v, uuid, depth + 1, seen) then return true end
+    end
+    return false
+end
+
+local function dump(v, path, depth, seen, prefix)
+    if lines >= MAX_LINES or depth > MAX_DEPTH then return end
+    if type(v) ~= "table" then
+        lines += 1
+        print(prefix, path .. " = " .. s(v))
+        return
+    end
+    seen = seen or {}
+    if seen[v] then
+        lines += 1
+        print(prefix, path .. " = <cycle>")
+        return
+    end
+    seen[v] = true
+
+    local keys = {}
+    for k in pairs(v) do keys[#keys + 1] = k end
+    table.sort(keys, function(a,b) return s(a) < s(b) end)
+
+    for _, k in ipairs(keys) do
+        if lines >= MAX_LINES then break end
+        local child = v[k]
+        local p = path .. "/" .. s(k)
+        if type(child) == "table" then
+            lines += 1
+            print(prefix, p .. " = <table>")
+            dump(child, p, depth + 1, seen, prefix)
+        else
+            lines += 1
+            print(prefix, p .. " = " .. s(child))
+        end
+    end
+end
+
+local function findGenerated(v, path, depth, seen, packet)
+    if lines >= MAX_LINES or depth > MAX_DEPTH or type(v) ~= "table" then return end
+    seen = seen or {}
+    if seen[v] then return end
+    seen[v] = true
+
+    for k, child in pairs(v) do
+        if lines >= MAX_LINES then break end
+        local key = s(k)
+        local p = path .. "/" .. key
+
+        if key == "GeneratedPetData" and type(child) == "table" then
+            print("============================================")
+            print("[FABLE-PROBE-V3] GeneratedPetData FOUND")
+            print("[FABLE-PROBE-V3] Packet:", packet.seq)
+            print("[FABLE-PROBE-V3] Ready dt:", string.format("%+.4f", packet.time - readyAt))
+            print("[FABLE-PROBE-V3] Path:", p)
+            print("[FABLE-PROBE-V3] FULL CONTENT:")
+            dump(child, p, 0, {}, "[GENERATED]")
+            print("============================================")
+        elseif key == "BaseWeight" or key == "WeightRange" or key == "PetType" or key == "HatchedFrom" then
+            lines += 1
+            print("[FABLE-PROBE-V3][" .. key .. "]", p, "=", s(child))
+        end
+
+        if type(child) == "table" then
+            findGenerated(child, p, depth + 1, seen, packet)
+        end
+    end
+end
+
+local function inspect(packet, mode)
+    if not readyAt then return end
+    if lines >= MAX_LINES then return end
+    print(string.format("[FABLE-PROBE-V3][%s] packet #%d dt=%+.4fs args=%d", mode, packet.seq, packet.time - readyAt, #packet.values))
+    for i, v in ipairs(packet.values) do
+        findGenerated(v, "ARG[" .. i .. "]", 0, {}, packet)
+    end
+end
+
+DataStream.OnClientEvent:Connect(function(...)
+    seq += 1
+    local packet = {seq = seq, time = os.clock(), values = {...}}
+    packets[#packets + 1] = packet
+    prune()
+
+    if readyAt and packet.time <= readyAt + POST then
+        inspect(packet, "POST_READY")
+    end
+end)
+
+ReadyRE.OnClientEvent:Connect(function(petType, eggUUID)
+    readyPet = s(petType)
+    readyUUID = s(eggUUID)
+    readyAt = os.clock()
+    lines = 0
+
+    print("============================================")
+    print("[FABLE-PROBE-V3] EGG READY")
+    print("[FABLE-PROBE-V3] Player:", player.Name)
+    print("[FABLE-PROBE-V3] PetType:", readyPet)
+    print("[FABLE-PROBE-V3] EggUUID:", readyUUID)
+    print("[FABLE-PROBE-V3] Searching previous", BUFFER, "seconds...")
+    print("[FABLE-PROBE-V3] Capturing next", POST, "seconds...")
+    print("============================================")
+
+    local found = 0
+    for _, packet in ipairs(packets) do
+        if packet.time >= readyAt - BUFFER and packet.time <= readyAt then
+            if hasUUID(packet.values, readyUUID, 0, {}) then
+                found += 1
+                inspect(packet, "PRE_READY")
+            end
+        end
+    end
+
+    if found == 0 then
+        print("[FABLE-PROBE-V3] No pre-ready packet contained this UUID.")
+    else
+        print("[FABLE-PROBE-V3] Pre-ready UUID packets:", found)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        prune()
+    end
+end)
+
+print("============================================")
+print("[FABLE-PROBE-V3] LOADED")
+print("[FABLE-PROBE-V3] Continuous DataStream buffer active")
+print("[FABLE-PROBE-V3] Waiting for EggReadyToHatch_RE...")
+print("[FABLE-PROBE-V3] No game actions performed")
+print("============================================")
