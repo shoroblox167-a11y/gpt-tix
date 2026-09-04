@@ -1,1 +1,0 @@
--- Fable Auto Hatch v5.2 is available as the corresponding standalone executor build.
