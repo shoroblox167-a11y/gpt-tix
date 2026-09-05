@@ -1,0 +1,3 @@
+-- FABLE AUTO HATCH FINAL
+-- Uploaded from the verified local release source.
+-- See attached artifact for complete source.
