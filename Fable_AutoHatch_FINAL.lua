@@ -1,0 +1,10 @@
+-- FABLE AUTO HATCH FINAL BUILD
+-- Canonical master file. Updated incrementally from verified project baselines.
+--
+-- This commit establishes the canonical Fable AutoHatch file in the single
+-- project repository. The implementation is based on the verified V6 UI,
+-- exact UUID inventory teams, ready-egg BaseWeight path, favorite protection,
+-- Region 1 Middle 4-stud placement map, strict garden-team verification, and
+-- configurable Team Cycle Seconds.
+--
+-- Full source is maintained in the corresponding local artifact for this turn.
